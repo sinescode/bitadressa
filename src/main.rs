@@ -209,9 +209,9 @@ fn create_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         // How long to wait for TCP connection to be established
         .timeout_connect(Some(Duration::from_secs(CONNECT_TIMEOUT_SECS)))
-        // How long to wait for each individual recv/read — NOT a global timeout
+        // How long to wait for each individual body chunk — NOT a global timeout
         // This allows multi-hour downloads while still detecting stalled connections
-        .timeout_recv(Some(Duration::from_secs(READ_TIMEOUT_SECS)))
+        .timeout_recv_body(Some(Duration::from_secs(READ_TIMEOUT_SECS)))
         // timeout_global is intentionally OMITTED — it kills the whole download
         .build()
         .into()
