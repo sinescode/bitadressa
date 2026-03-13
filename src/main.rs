@@ -9,10 +9,10 @@ const URL: &str = "https://gz.blockchair.com/bitcoin/addresses/blockchair_bitcoi
 const OUTPUT_FILE: &str = "blockchair_bitcoin_addresses_latest.tsv.gz";
 const CHUNK_SIZE: usize = 65536;
 const CONNECT_TIMEOUT_SECS: u64 = 30;
-const READ_TIMEOUT_SECS: u64 = 120;
+const READ_TIMEOUT_SECS: u64 = 60;   // per-read timeout, NOT global
 const PROGRESS_UPDATE_INTERVAL_SECS: f64 = 0.5;
-const MAX_RETRIES: u32 = 5;
-const RETRY_DELAY_MS: u64 = 1000;
+const MAX_RETRIES: u32 = 99;         // keep retrying indefinitely
+const RETRY_DELAY_MS: u64 = 3000;
 
 #[derive(Debug)]
 enum DownloadError {
@@ -98,7 +98,7 @@ impl ProgressBar {
         );
 
         let eta = total.and_then(|t| {
-            if speed > 0.0 {
+            if speed > 0.0 && current < t {
                 Some((t - current) as f64 / speed)
             } else {
                 None
@@ -207,7 +207,12 @@ fn setup_ctrlc_handler() -> Arc<AtomicBool> {
 
 fn create_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(READ_TIMEOUT_SECS)))
+        // How long to wait for TCP connection to be established
+        .timeout_connect(Some(Duration::from_secs(CONNECT_TIMEOUT_SECS)))
+        // How long to wait for each individual recv/read — NOT a global timeout
+        // This allows multi-hour downloads while still detecting stalled connections
+        .timeout_recv(Some(Duration::from_secs(READ_TIMEOUT_SECS)))
+        // timeout_global is intentionally OMITTED — it kills the whole download
         .build()
         .into()
 }
@@ -243,7 +248,6 @@ fn make_request(
     }
 
     req.call().map_err(|e| match e {
-        // FIX 1: ureq 3.x uses StatusCode(u16) instead of Status, and no Transport variant
         ureq::Error::StatusCode(code) => {
             let msg = match code {
                 402 => "Payment Required: Range requests blocked on free tier".to_string(),
@@ -252,20 +256,16 @@ fn make_request(
             };
             DownloadError::Http(code, msg)
         }
-        // FIX 1: Catch-all replaces the old Transport variant
         e => DownloadError::Transport(e.to_string()),
     })
 }
 
-// FIX 2: Accept `impl Read` instead of `&mut ureq::Body`
-// ureq 3.x Body does not impl Read directly; use into_reader() at the call site
 fn download_chunk(
     reader: &mut impl Read,
     file: &mut std::fs::File,
     buf: &mut [u8],
     running: &Arc<AtomicBool>,
 ) -> Result<usize, DownloadError> {
-    // FIX 3: now that reader is `impl Read`, the error type is io::Error — no annotation needed
     match reader.read(buf) {
         Ok(0) => Ok(0),
         Ok(n) => {
@@ -278,7 +278,7 @@ fn download_chunk(
         Err(e) if e.kind() == io::ErrorKind::TimedOut
             || e.kind() == io::ErrorKind::WouldBlock =>
         {
-            Err(DownloadError::Transport(format!("Timeout: {}", e)))
+            Err(DownloadError::Transport(format!("Read timeout: {}", e)))
         }
         Err(e) => Err(DownloadError::Io(e)),
     }
@@ -291,7 +291,7 @@ fn download_with_resume(
 ) -> Result<(), DownloadError> {
     let path = Path::new(output_file);
     let mut downloaded = get_existing_file_size(path);
-    let mut retries = 0;
+    let mut retries = 0u32;
 
     println!("{}", "━".repeat(60));
     println!("  📥  Bitcoin Addresses Dataset Downloader");
@@ -308,6 +308,10 @@ fn download_with_resume(
     println!("{}", "─".repeat(60));
 
     loop {
+        if !running.load(Ordering::SeqCst) {
+            return Err(DownloadError::Cancelled);
+        }
+
         let agent = create_agent();
         let response = match make_request(&agent, url, downloaded) {
             Ok(r) => r,
@@ -320,11 +324,18 @@ fn download_with_resume(
                 if retries >= MAX_RETRIES {
                     return Err(DownloadError::MaxRetriesExceeded);
                 }
-                eprintln!("  ⚠️  Attempt {}/{} failed: {}", retries, MAX_RETRIES, e);
-                std::thread::sleep(Duration::from_millis(RETRY_DELAY_MS * retries as u64));
+                let delay = RETRY_DELAY_MS * retries as u64;
+                eprintln!(
+                    "  ⚠️  Attempt {}/{} failed: {} — retrying in {}ms...",
+                    retries, MAX_RETRIES, e, delay
+                );
+                std::thread::sleep(Duration::from_millis(delay));
                 continue;
             }
         };
+
+        // Reset retry counter on successful connection
+        retries = 0;
 
         let status = response.status();
         let total_size: Option<u64> = response
@@ -341,10 +352,7 @@ fn download_with_resume(
         println!("{}", "─".repeat(60));
 
         let mut file = open_output_file(path, downloaded > 0 && status == 206)?;
-
-        // FIX 2: Call .into_body().into_reader() so we get an impl Read
         let mut reader = response.into_body().into_reader();
-
         let mut buf = vec![0u8; CHUNK_SIZE];
         let mut stats = DownloadStats::new();
         let mut progress = ProgressBar::new(20);
@@ -370,16 +378,12 @@ fn download_with_resume(
                         stats.reset_interval();
                     }
                 }
-                Err(DownloadError::Transport(_)) => {
+                Err(DownloadError::Transport(_)) | Err(DownloadError::Io(_)) => {
                     let _ = file.flush();
                     progress.clear();
-                    println!("  ⚠️  Connection stalled, retrying...");
-                    retries += 1;
-                    if retries >= MAX_RETRIES {
-                        return Err(DownloadError::MaxRetriesExceeded);
-                    }
+                    println!("  ⚠️  Connection stalled, reconnecting in {}ms...", RETRY_DELAY_MS);
                     std::thread::sleep(Duration::from_millis(RETRY_DELAY_MS));
-                    break;
+                    break; // break inner loop → reconnect in outer loop
                 }
                 Err(e) => {
                     let _ = file.flush();
