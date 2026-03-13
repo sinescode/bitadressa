@@ -1,0 +1,49 @@
+name: Download Blockchair via Rust Binary
+
+on:
+  workflow_dispatch: # Manual trigger from GitHub UI
+
+jobs:
+  build-and-download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours max (GitHub limit)
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run binary to download file
+        run: ./target/release/blockchair_downloader
+
+      - name: Show file info
+        if: always()
+        run: |
+          ls -lh blockchair_bitcoin_addresses_latest.tsv.gz || echo "File not found"
+          md5sum blockchair_bitcoin_addresses_latest.tsv.gz || true
+
+      - name: Upload as artifact
+        uses: actions/upload-artifact@v4
+        if: always()  # Upload even if partially downloaded
+        with:
+          name: blockchair-bitcoin-addresses
+          path: blockchair_bitcoin_addresses_latest.tsv.gz
+          retention-days: 5
+          if-no-files-found: warn
+          
